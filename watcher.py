@@ -478,7 +478,10 @@ def send_email(items: list[dict]):
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(build_email_html(items), "html"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
     log.info(f"Email sent — {len(items)} transaction(s)")
