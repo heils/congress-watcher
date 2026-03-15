@@ -478,6 +478,9 @@ def send_email(items: list[dict]):
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(build_email_html(items), "html"))
 
+    log.info(f"DEBUG — SENDER: {EMAIL_SENDER}")
+    log.info(f"DEBUG — RECIPIENT: {EMAIL_RECIPIENT}")
+    log.info(f"DEBUG — PASSWORD length: {len(EMAIL_PASSWORD)} chars, first2: {EMAIL_PASSWORD[:2]!r}, last2: {EMAIL_PASSWORD[-2:]!r}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
