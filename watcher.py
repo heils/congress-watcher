@@ -478,10 +478,7 @@ def send_email(items: list[dict]):
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(build_email_html(items), "html"))
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
     log.info(f"Email sent — {len(items)} transaction(s)")
@@ -491,25 +488,23 @@ def send_email(items: list[dict]):
 def run():
     names = [f"{ln} (House)" for ln, _ in WATCH_LIST]
     log.info(f"Congress Watcher started. Watching: {', '.join(names)}")
-    log.info(f"Checking every {CHECK_INTERVAL_HOURS} hours.")
 
-    while True:
-        log.info("Running check...")
-        seen      = load_seen()
-        new_items = check_all(seen)
+    log.info("Running check...")
+    seen      = load_seen()
+    new_items = check_all(seen)
 
-        if new_items:
-            log.info(f"Found {len(new_items)} new transaction(s). Sending email...")
-            try:
-                send_email(new_items)
-            except Exception as e:
-                log.error(f"Failed to send email: {e}")
-        else:
-            log.info("No new filings found.")
+    if new_items:
+        log.info(f"Found {len(new_items)} new transaction(s). Sending email...")
+        try:
+            send_email(new_items)
+        except Exception as e:
+            log.error(f"Failed to send email: {e}")
+            raise
+    else:
+        log.info("No new filings found.")
 
-        save_seen(seen)
-        log.info(f"Sleeping {CHECK_INTERVAL_HOURS}h until next check...")
-        time.sleep(CHECK_INTERVAL_HOURS * 3600)
+    save_seen(seen)
+    log.info("Done.")
 
 if __name__ == "__main__":
     run()
