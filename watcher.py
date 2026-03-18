@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 WATCH_LIST = [
-    ("Higgins",           "House"),
+    ("McCaul",           "House"),
     ("Wasserman Schultz", "House"),
     ("Rouzer",            "House"),
     ("Green",             "House"),
