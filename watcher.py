@@ -5,6 +5,7 @@ import smtplib
 import logging
 import requests
 import pypdf
+import time
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -595,4 +596,13 @@ def run():
     log.info("Done.")
 
 if __name__ == "__main__":
-    run()
+    while True:
+        try:
+            run()
+        except Exception as e:
+            log.error(f"An error occurred during the run: {e}")
+        
+        # Calculate seconds to sleep based on your 8-hour variable
+        sleep_seconds = CHECK_INTERVAL_HOURS * 3600
+        log.info(f"Sleeping for {CHECK_INTERVAL_HOURS} hours before the next check...")
+        time.sleep(sleep_seconds)
