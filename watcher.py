@@ -1,15 +1,16 @@
 import os
 import re
 import io
-import json
-import time
 import smtplib
 import logging
 import requests
 import pypdf
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from itertools import groupby
+from collections import Counter
+from supabase import create_client, Client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,21 +21,32 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+# Optimized Watch List (AI, Space, Energy/Electricity, Biotech/Pharma)
 WATCH_LIST = [
-    ("McCaul",           "House"),
-    ("Wasserman Schultz", "House"),
-    ("Rouzer",            "House"),
-    ("Green",             "House"),
-    ("Pelosi",            "House"),
+    ("Pelosi", "House"),            # Heavy AI/Tech (Nvidia, Broadcom, Microsoft)
+    ("Khanna", "House"),            # Extremely active, high volume in Tech, Bio, and Aerospace
+    ("Gottheimer", "House"),        # High volume options trader, Tech, Biotech
+    ("McCaul", "House"),            # Space/Defense, Tech, high net worth
+    ("Hern", "House"),              # Energy, Aerospace, Pharma
+    ("DelBene", "House"),           # AI/Tech (Former Microsoft executive)
+    ("Beyer", "House"),             # Tech, Biotech
+    ("Crenshaw", "House"),          # Tech, Space/Defense
+    ("Green", "House"),             # Energy, Pharma
+    ("Wasserman Schultz", "House"), # Biotech, Pharma
 ]
 
 CHECK_INTERVAL_HOURS = 8
-SEEN_FILE    = "seen_filings.json"
 CURRENT_YEAR = datetime.now().year
 
+# Email Credentials
 EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
 EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
 EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
+
+# Supabase Credentials
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -59,16 +71,14 @@ TYPE_COLORS = {
 # ── Regex (compiled once) ─────────────────────────────────────────────────────
 
 OWNER_RE    = re.compile(r'^(SP|DC|JT|OT|H)\s+')
-TICKER_RE   = re.compile(r'\(([A-Z][A-Z0-9.]{0,5})\)')   # handles BRK.B, etc.
+TICKER_RE   = re.compile(r'\(([A-Z][A-Z0-9.]{0,5})\)')
 AMT_RE      = re.compile(r'\$[\d,]+(?:\.\d{2})?\s*-\s*\$[\d,]+(?:\.\d{2})?|\$[\d,]+\.\d{2}')
 AMT_CUT     = re.compile(r'(\$[\d,]+(?:\.\d{2})?)\s*-\s*$')
-# Core pattern: [TAG] immediately (or with 1 space) before S/P + two dates
 TAG_TX      = re.compile(
     r'\[[A-Z]{2,3}\]\s*'
     r'(S \(partial\)|P \(partial\)|S \(exchange\)|P \(exchange\)|E|W|[SP])\s+'
     r'(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})(.*)'
 )
-# Boilerplate lines to skip — expanded to catch post-table junk
 SKIP        = re.compile(
     r'^(F\s*S:|S\s*O:|L\s*:|D\s*:|Filing Status|Subholding|Location|Description'
     r'|I CERTIFY|Digitally|Filing ID|\* For|\bYes\b.*\bNo\b|^\s*Yes$|^\s*No$'
@@ -114,13 +124,11 @@ def get_ticker(asset_raw: str) -> str:
     return "N/A"
 
 def clean_asset(raw: str) -> str:
-    s = re.sub(r'\[.*?\].*', '', raw)   # strip from [TAG] onward
+    s = re.sub(r'\[.*?\].*', '', raw)
     s = TICKER_RE.sub('', s)
     s = OWNER_RE.sub('', s)
     s = re.sub(r'^\$[\d,]+\S*\s*', '', s)
-    # Strip leading date fragments like "1/16 /26." that leak from description lines
     s = re.sub(r'^\d{1,2}/\d{1,2}[\s/]*\d{2,4}\.?\s*', '', s)
-    # Strip leading description fragments
     s = re.sub(r'^(were |as a result|at a strike|and an expir).*', '', s, flags=re.I)
     return s.strip()
 
@@ -135,30 +143,79 @@ def get_amount(rest: str, next_line: str) -> str:
             return m2.group(0)
     return "N/A"
 
-def load_seen() -> set:
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE) as f:
-            return set(json.load(f))
-    return set()
+# ── Database Functions (Supabase) ─────────────────────────────────────────────
 
-def save_seen(seen: set):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen), f)
+def is_filing_seen(doc_url: str) -> bool:
+    uid = f"filing_{doc_url}"
+    try:
+        result = supabase.table("seen_filings").select("filing_id").eq("filing_id", uid).execute()
+        return len(result.data) > 0
+    except Exception as e:
+        log.error(f"Error checking Supabase for filing {uid}: {e}")
+        return False
+
+def mark_filing_seen(doc_url: str):
+    uid = f"filing_{doc_url}"
+    try:
+        supabase.table("seen_filings").insert({"filing_id": uid}).execute()
+    except Exception as e:
+        log.error(f"Error saving filing to Supabase {uid}: {e}")
+
+def check_for_clusters(new_trade: dict) -> list:
+    """Finds matching trades by OTHER politicians within the last 30 days"""
+    if new_trade["ticker"] in ("N/A", "—", ""):
+        return []
+
+    try:
+        # Convert our clean date format ("Feb 14, 2026") to SQL format ("2026-02-14")
+        trade_date = datetime.strptime(new_trade["transaction_date"], "%b %d, %Y")
+    except ValueError:
+        return [] 
+        
+    thirty_days_ago = (trade_date - timedelta(days=30)).strftime("%Y-%m-%d")
+    trade_date_str = trade_date.strftime("%Y-%m-%d")
+
+    try:
+        # Query Supabase for matching ticker & direction by a different person
+        response = supabase.table("parsed_trades") \
+            .select("*") \
+            .eq("ticker", new_trade["ticker"]) \
+            .eq("transaction_type", new_trade["transaction_type"]) \
+            .neq("representative_name", new_trade["name"]) \
+            .gte("transaction_date", thirty_days_ago) \
+            .lte("transaction_date", trade_date_str) \
+            .execute()
+        return response.data
+    except Exception as e:
+        log.error(f"Error checking clusters in Supabase: {e}")
+        return []
+
+def log_trade(new_trade: dict):
+    """Save trade to DB for future clustering lookbacks"""
+    if new_trade["ticker"] in ("N/A", "—", ""):
+        return
+
+    try:
+        trade_date = datetime.strptime(new_trade["transaction_date"], "%b %d, %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        # Fallback to today if parsing fails
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        supabase.table("parsed_trades").insert({
+            "filing_url": new_trade["doc_url"],
+            "representative_name": new_trade["name"],
+            "ticker": new_trade["ticker"],
+            "transaction_type": new_trade["transaction_type"],
+            "amount_range": new_trade["amount"],
+            "transaction_date": trade_date
+        }).execute()
+    except Exception as e:
+        log.error(f"Error logging trade to Supabase: {e}")
 
 # ── PDF parser ────────────────────────────────────────────────────────────────
 
 def parse_ptr_pdf(pdf_url: str) -> list[dict]:
-    """
-    Download a House PTR PDF and extract all individual transactions.
-
-    Real PDFs from disclosures-clerk.house.gov contain null bytes (\\x00) between
-    characters. After stripping those, each transaction line looks like:
-
-        AssetName (TICKER)  [ST]S MM/DD/YYYY MM/DD/YYYY $amount
-        AssetName  [OT] P MM/DD/YYYY MM/DD/YYYY $amount -    <- amount may wrap
-
-    Asset names often span multiple preceding lines.
-    """
     transactions = []
     try:
         resp = requests.get(pdf_url, headers=HEADERS, timeout=30)
@@ -170,28 +227,23 @@ def parse_ptr_pdf(pdf_url: str) -> list[dict]:
         sm = re.search(r'Digitally Signed[\s:].+?(\d{1,2}/\d{1,2}/\d{4})', text)
         signed_date = fmt_date(sm.group(1)) if sm else ""
 
-        # Strip "Filing ID #XXXXX" that pypdf sometimes appends mid-line
         text  = re.sub(r'Filing ID #\d+', '', text)
         lines = [l.strip() for l in text.split('\n')]
         asset_lines  = []
-        orphan_asset = ""   # ticker/asset saved from an orphaned [TAG] line
+        orphan_asset = ""
         in_tx        = False
 
-        # Fallback: line has dates but no [TAG] — catches Broadcom page-break case
         NO_TAG_TX = re.compile(
             r'^(.+?)\s+(S \(partial\)|P \(partial\)|[SP])\s+'
             r'(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})\s+'
             r'(\$[\d,]+(?:\.\d{2})?(?:\s*-\s*\$[\d,]+(?:\.\d{2})?)?)'
         )
-        # Orphaned tag: line ends with [TAG] and nothing after (page-break artifact)
         ORPHAN_TAG = re.compile(r'^(.*?)\[[A-Z]{2,3}\]\s*$')
 
         for i, line in enumerate(lines):
             if not line:
                 continue
 
-            # Detect entry into transaction table — must happen BEFORE skip check
-            # because "ID OwnerAsset" and "$200?" both match the SKIP pattern
             if '$200?' in line or 'ID OwnerAsset' in line:
                 in_tx        = True
                 asset_lines  = []
@@ -201,15 +253,13 @@ def parse_ptr_pdf(pdf_url: str) -> list[dict]:
             if SKIP.match(line):
                 continue
             if re.match(r'^\$[\d,]+(?:\.\d{2})?$', line):
-                continue  # lone amount continuation
+                continue
 
             next_line = lines[i + 1] if i + 1 < len(lines) else ""
 
-            # Main pattern: line contains [TAG]S or [TAG] P followed by dates
             tag_m = TAG_TX.search(line)
             if tag_m and in_tx:
                 before_tag = OWNER_RE.sub('', line[:tag_m.start()]).strip()
-                # If we have a saved orphan asset from a page-break, prepend it
                 parts = []
                 if orphan_asset:
                     parts.append(orphan_asset)
@@ -235,18 +285,13 @@ def parse_ptr_pdf(pdf_url: str) -> list[dict]:
             if not in_tx:
                 continue
 
-            # Orphaned [TAG] line (page break split asset from its tx line)
-            # e.g. "(AVGO)  [ST]" or "Common Stock (COST)  [ST]" with no dates
             orp_m = ORPHAN_TAG.match(line)
             if orp_m:
                 fragment = OWNER_RE.sub('', orp_m.group(1)).strip()
-                # Special case: if last transaction was a no-tag fallback and this
-                # orphan has the ticker for it, update that transaction in place
                 if transactions and fragment:
                     ticker_m = TICKER_RE.search(fragment)
                     if ticker_m and transactions[-1].get("ticker") == "N/A":
                         transactions[-1]["ticker"] = ticker_m.group(1)
-                        # Also improve asset name by appending the fragment
                         existing = transactions[-1].get("asset", "")
                         extra = re.sub(r'\[.*?\]', '', fragment)
                         extra = TICKER_RE.sub('', extra).strip()
@@ -254,13 +299,10 @@ def parse_ptr_pdf(pdf_url: str) -> list[dict]:
                             transactions[-1]["asset"] = (existing + " " + extra).strip()[:60]
                         asset_lines = []
                         continue
-                # Otherwise save as orphan for next transaction
                 orphan_asset = ' '.join(asset_lines + ([fragment] if fragment else []))
                 asset_lines  = []
                 continue
 
-            # Fallback: asset line that has dates but no [TAG] (other page-break variant)
-            # e.g. "Broadcom Inc. - Common Stock P 05/05/2025 05/06/2025 $1,001 - $15,000"
             no_tag_m = NO_TAG_TX.match(line)
             if no_tag_m and in_tx:
                 asset_fragment = OWNER_RE.sub('', no_tag_m.group(1)).strip()
@@ -278,11 +320,10 @@ def parse_ptr_pdf(pdf_url: str) -> list[dict]:
                 })
                 continue
 
-            # Accumulate asset name lines
             if re.match(r'^[A-Z]\s{1,3}[A-Z](\s{1,3}[A-Z])?$', line):
-                continue  # spaced letter boilerplate
+                continue
             if OWNER_RE.match(line) and asset_lines:
-                asset_lines = []  # new owner prefix = new asset entry
+                asset_lines = []
             clean = OWNER_RE.sub('', line).strip()
             if clean:
                 asset_lines.append(clean)
@@ -290,19 +331,14 @@ def parse_ptr_pdf(pdf_url: str) -> list[dict]:
     except Exception as e:
         log.error(f"PDF parse error for {pdf_url}: {e}")
 
-    # Dedup — use a counter per key so same-ticker same-account duplicates are kept
-    # (e.g. two IRA accounts both buying OXY same day same amount)
-    from collections import Counter
     key_counts: Counter = Counter()
     unique = []
     for t in transactions:
         base_key = (t["ticker"], t["transaction_date"], t["transaction_type"], t["amount"])
         key_counts[base_key] += 1
-        # Only keep first occurrence per key — true duplicates from PDF parsing artifacts
         if key_counts[base_key] == 1:
             unique.append(t)
         elif t["asset"] and t["asset"] != unique[-1].get("asset",""):
-            # Different asset description = genuinely different holding, keep it
             unique.append(t)
     return unique
 
@@ -349,28 +385,36 @@ def fetch_house_filings(last_name: str) -> list[dict]:
 
 # ── Check all ─────────────────────────────────────────────────────────────────
 
-def check_all(seen: set) -> list[dict]:
+def check_all() -> list[dict]:
     new_items = []
 
     for last_name, _ in WATCH_LIST:
         filings = fetch_house_filings(last_name)
         for f in filings:
-            uid = f"filing_{f['doc_url']}"
-            if uid not in seen:
-                seen.add(uid)
+            doc_url = f["doc_url"]
+            if not is_filing_seen(doc_url):
                 log.info(f"New filing: {f['name']} — {f['filing_type']} — parsing PDF...")
-                transactions = parse_ptr_pdf(f["doc_url"])
+                transactions = parse_ptr_pdf(doc_url)
 
                 if transactions:
                     for tx in transactions:
-                        new_items.append({
+                        new_trade = {
                             "name":         f["name"],
                             "filing_type":  f["filing_type"],
                             "doc_url":      f["doc_url"],
                             **tx,
-                        })
+                        }
+                        
+                        # Database Cluster Check
+                        cluster_matches = check_for_clusters(new_trade)
+                        if cluster_matches:
+                            new_trade["cluster_alert"] = cluster_matches
+                            
+                        new_items.append(new_trade)
+                        
+                        # Log to persistent ledger
+                        log_trade(new_trade)
                 else:
-                    # PDF parse failed — still notify with link
                     new_items.append({
                         "name":               f["name"],
                         "filing_type":        f["filing_type"],
@@ -383,20 +427,32 @@ def check_all(seen: set) -> list[dict]:
                         "amount":             "—",
                         "signed_date":        "—",
                     })
+                
+                # Mark as processed in Supabase
+                mark_filing_seen(doc_url)
 
     return new_items
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
 def build_email_html(items: list[dict]) -> str:
-    # Group by filing (doc_url) so we can handle large filings gracefully
-    from itertools import groupby
+    # Handle the empty items case unconditionally
+    if not items:
+        return f"""<html><body style="font-family:sans-serif;color:#222;max-width:960px;margin:auto;padding:24px;">
+  <h2 style="color:#1a1a2e;margin-bottom:4px;">Congress Stock Filing Alert</h2>
+  <p style="color:#555;margin-top:0;">
+    No new transactions found during this check.
+  </p>
+  <p style="color:#aaa;font-size:11px;margin-top:24px;">
+    Source: disclosures-clerk.house.gov &middot; Checks every {CHECK_INTERVAL_HOURS}h
+  </p>
+</body></html>"""
+
     rows  = ""
     total = len(items)
     names = ", ".join(sorted({t["name"] for t in items}))
-    MAX_ROWS_PER_FILING = 30  # Gmail clips at ~102KB; keep emails lean
+    MAX_ROWS_PER_FILING = 30 
 
-    # Group consecutive items by doc_url
     for doc_url, group in groupby(items, key=lambda x: x.get("doc_url", "")):
         group_list    = list(group)
         is_first_row  = True
@@ -417,12 +473,22 @@ def build_email_html(items: list[dict]) -> str:
             is_first_row = False
             shown += 1
 
+            # Inject the Cluster Alert visual indicator inside the asset column if triggered
+            cluster_html = ""
+            if tx.get("cluster_alert"):
+                matches = tx["cluster_alert"]
+                cluster_text = "<br>".join([
+                    f"🚨 <b>{m['representative_name']}</b> also executed a <b>{m['transaction_type']}</b> on {m['transaction_date']} ({m.get('amount_range', '—')})"
+                    for m in matches
+                ])
+                cluster_html = f'<div style="margin-top:8px;padding:8px;background:#fff3cd;color:#856404;border-radius:4px;font-size:11px;border:1px solid #ffeeba;"><b>CLUSTER ALERT:</b><br>{cluster_text}</div>'
+
             rows += f"""
         <tr style="{row_border}">
           <td style="padding:9px 8px;">{name_cell}</td>
           <td style="padding:9px 8px;font-weight:600;color:{fg};background:{bg};text-align:center;">{tx_type}</td>
           <td style="padding:9px 8px;font-weight:600;">{tx.get('ticker','—')}</td>
-          <td style="padding:9px 8px;font-size:12px;">{tx.get('asset','—')}</td>
+          <td style="padding:9px 8px;font-size:12px;">{tx.get('asset','—')}{cluster_html}</td>
           <td style="padding:9px 8px;">{tx.get('transaction_date','—')}</td>
           <td style="padding:9px 8px;">{tx.get('notification_date','—')}</td>
           <td style="padding:9px 8px;">{tx.get('amount','—')}</td>
@@ -438,7 +504,7 @@ def build_email_html(items: list[dict]) -> str:
           </td>
         </tr>"""
 
-    return f"""<html><body style="font-family:sans-serif;color:#222;max-width:960px;margin:auto;padding:24px;">
+    return f"""<html><body style="font-family:sans-serif;color:#222;max-width:1100px;margin:auto;padding:24px;">
   <h2 style="color:#1a1a2e;margin-bottom:4px;">Congress Stock Filing Alert</h2>
   <p style="color:#555;margin-top:0;">
     <b>{total}</b> new transaction(s) from <b>{names}</b><br>
@@ -466,25 +532,30 @@ def build_email_html(items: list[dict]) -> str:
 
 def send_email(items: list[dict]):
     msg   = MIMEMultipart("alternative")
-    names = ", ".join(sorted({t["name"] for t in items}))
-    msg["Subject"] = f"Congress Trade Alert — {len(items)} transaction(s) — {names}"
+    
+    if items:
+        names = ", ".join(sorted({t["name"] for t in items}))
+        msg["Subject"] = f"Congress Trade Alert — {len(items)} transaction(s) — {names}"
+        plain = "\n".join(
+            f"{t['name']} | {t['transaction_type']} {t['ticker']} | {t['transaction_date']} | {t['amount']}"
+            for t in items
+        )
+    else:
+        msg["Subject"] = "Congress Trade Status — No New Transactions"
+        plain = "No new transactions found during this check."
+
     msg["From"]    = EMAIL_SENDER
     msg["To"]      = EMAIL_RECIPIENT
 
-    plain = "\n".join(
-        f"{t['name']} | {t['transaction_type']} {t['ticker']} | {t['transaction_date']} | {t['amount']}"
-        for t in items
-    )
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(build_email_html(items), "html"))
 
-    log.info(f"DEBUG — SENDER: {EMAIL_SENDER}")
-    log.info(f"DEBUG — RECIPIENT: {EMAIL_RECIPIENT}")
-    log.info(f"DEBUG — PASSWORD length: {len(EMAIL_PASSWORD)} chars, first2: {EMAIL_PASSWORD[:2]!r}, last2: {EMAIL_PASSWORD[-2:]!r}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
-    log.info(f"Email sent — {len(items)} transaction(s)")
+    
+    status = f"{len(items)} transaction(s)" if items else "No new transactions"
+    log.info(f"Email sent — {status}")
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
@@ -493,20 +564,20 @@ def run():
     log.info(f"Congress Watcher started. Watching: {', '.join(names)}")
 
     log.info("Running check...")
-    seen      = load_seen()
-    new_items = check_all(seen)
+    new_items = check_all()
 
     if new_items:
         log.info(f"Found {len(new_items)} new transaction(s). Sending email...")
-        try:
-            send_email(new_items)
-        except Exception as e:
-            log.error(f"Failed to send email: {e}")
-            raise
     else:
-        log.info("No new filings found.")
+        log.info("No new filings found. Sending status email...")
 
-    save_seen(seen)
+    try:
+        # Email will now trigger regardless of new_items being empty or not
+        send_email(new_items)
+    except Exception as e:
+        log.error(f"Failed to send email: {e}")
+        raise
+
     log.info("Done.")
 
 if __name__ == "__main__":
