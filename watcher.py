@@ -39,10 +39,9 @@ WATCH_LIST = [
 CHECK_INTERVAL_HOURS = 8
 CURRENT_YEAR = datetime.now().year
 
-# Email Credentials
-EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
-EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
+# Email Credentials (Resend)
 EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
+RESEND_API_KEY  = os.environ["RESEND_API_KEY"]
 
 # Supabase Credentials
 SUPABASE_URL = os.environ["SUPABASE_URL"]
