@@ -531,31 +531,45 @@ def build_email_html(items: list[dict]) -> str:
 </body></html>"""
 
 def send_email(items: list[dict]):
-    msg   = MIMEMultipart("alternative")
+    # Note: We now only need EMAIL_RECIPIENT and RESEND_API_KEY from os.environ
+    recipient = os.environ["EMAIL_RECIPIENT"]
+    resend_key = os.environ["RESEND_API_KEY"]
     
     if items:
         names = ", ".join(sorted({t["name"] for t in items}))
-        msg["Subject"] = f"Congress Trade Alert — {len(items)} transaction(s) — {names}"
+        subject = f"Congress Trade Alert — {len(items)} transaction(s) — {names}"
         plain = "\n".join(
             f"{t['name']} | {t['transaction_type']} {t['ticker']} | {t['transaction_date']} | {t['amount']}"
             for t in items
         )
     else:
-        msg["Subject"] = "Congress Trade Status — No New Transactions"
+        subject = "Congress Trade Status — No New Transactions"
         plain = "No new transactions found during this check."
 
-    msg["From"]    = EMAIL_SENDER
-    msg["To"]      = EMAIL_RECIPIENT
+    html_content = build_email_html(items)
 
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(build_email_html(items), "html"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+    # Use Resend's API to bypass the Railway SMTP block
+    headers = {
+        "Authorization": f"Bearer {resend_key}",
+        "Content-Type": "application/json"
+    }
     
-    status = f"{len(items)} transaction(s)" if items else "No new transactions"
-    log.info(f"Email sent — {status}")
+    payload = {
+        "from": "Congress Watcher <onboarding@resend.dev>", # Resend's default testing address
+        "to": recipient,
+        "subject": subject,
+        "html": html_content,
+        "text": plain
+    }
+
+    response = requests.post("https://api.resend.com/emails", json=payload, headers=headers)
+    
+    if response.status_code in (200, 201):
+        status = f"{len(items)} transaction(s)" if items else "No new transactions"
+        log.info(f"Email sent successfully via Resend — {status}")
+    else:
+        log.error(f"Failed to send email via Resend: {response.text}")
+        response.raise_for_status()
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
